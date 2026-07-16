@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparkedge-ercot"
+version = "0.1.0"
+description = "Implied heat rate & spark spread monitor for the ERCOT (Texas) power market."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "Vincent Delisi" }]
+dependencies = [
+    "gridstatus>=0.36",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "requests>=2.28",
+    "plotly>=5.18",
+    "streamlit>=1.30",
+]
+
+[project.scripts]
+sparkedge-ercot = "sparkedge_ercot.cli:main"
+
+[tool.setuptools]
+packages = ["sparkedge_ercot"]

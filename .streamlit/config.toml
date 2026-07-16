@@ -1,0 +1,15 @@
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+# Railway sets $PORT; the start command passes it via --server.port.
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#0b0f14"
+secondaryBackgroundColor = "#131922"
+textColor = "#e6edf3"
