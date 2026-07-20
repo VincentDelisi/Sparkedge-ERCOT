@@ -89,7 +89,19 @@ class Analytics:
             if gas.empty:
                 sub["gas_price"] = np.nan
             else:
-                sub = sub.merge(gas, on="date", how="left")
+                # EIA Henry Hub daily spot prices lag a few business days, so an
+                # exact same-day join leaves today's LMPs without gas. Use an
+                # as-of (backward) join so each interval picks up the most recent
+                # available gas price on or before its date, then forward-fill
+                # any remaining leading gaps.
+                gas = gas.sort_values("date").reset_index(drop=True)
+                sub = sub.sort_values("date").reset_index(drop=True)
+                sub = pd.merge_asof(
+                    sub, gas, on="date", direction="backward",
+                )
+                # if the very first days precede all gas history, backfill from
+                # the earliest known gas price so heat rates still compute.
+                sub["gas_price"] = sub["gas_price"].ffill().bfill()
             sub["implied_hr"] = sub["lmp"] / sub["gas_price"].replace(0, np.nan)
             frames.append(sub)
 
