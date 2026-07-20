@@ -265,6 +265,24 @@ def panel_duck_curve(an: Analytics) -> None:
     ramp = _safe(lambda: an.evening_ramp(nl), {})
 
     fig = go.Figure()
+
+    # Structural evening-ramp window (16:00-21:00 CT) is always shaded as
+    # context, so the "evening ramp highlighted" title holds even early in the
+    # day before a trough/peak can be detected. The band is clipped to the data
+    # actually plotted so it never floats in empty space.
+    day0 = nl["local"].dt.normalize().iloc[0]
+    ramp_win_start = day0 + pd.Timedelta(hours=16)
+    ramp_win_end = day0 + pd.Timedelta(hours=21)
+    xmin, xmax = nl["local"].min(), nl["local"].max()
+    band_x0 = max(ramp_win_start, xmin)
+    band_x1 = min(ramp_win_end, xmax)
+    if band_x1 > band_x0:
+        fig.add_vrect(x0=band_x0, x1=band_x1, fillcolor="#d62728",
+                      opacity=0.08, line_width=0, layer="below",
+                      annotation_text="Evening ramp window (16:00–21:00 CT)",
+                      annotation_position="top left",
+                      annotation_font_size=11, annotation_font_color="#d62728")
+
     fig.add_trace(go.Scatter(
         x=nl["local"], y=nl["load"], name="Load",
         line=dict(color="#9aa0a6", width=1.5),
@@ -273,13 +291,21 @@ def panel_duck_curve(an: Analytics) -> None:
         x=nl["local"], y=nl["net_load"], name="Net load (load − solar − wind)",
         line=dict(color="#f58518", width=2.5),
     ))
+    # When today's trough->peak ramp is detectable, mark it precisely on top.
     if ramp:
         rs = pd.Timestamp(ramp["ramp_start"]).tz_convert("US/Central")
         re = pd.Timestamp(ramp["ramp_end"]).tz_convert("US/Central")
-        fig.add_vrect(x0=rs, x1=re, fillcolor="#d62728", opacity=0.12,
-                      line_width=0,
-                      annotation_text=f"Evening ramp +{ramp['ramp_mw']:,.0f} MW",
-                      annotation_position="top left")
+        fig.add_trace(go.Scatter(
+            x=[rs, re],
+            y=[ramp["trough_mw"], ramp["peak_mw"]],
+            mode="markers+text",
+            marker=dict(color="#d62728", size=9, symbol="circle"),
+            text=["trough", f"+{ramp['ramp_mw']:,.0f} MW"],
+            textposition="top center",
+            textfont=dict(color="#d62728", size=11),
+            name="Detected ramp",
+            showlegend=False,
+        ))
     fig.update_layout(
         height=380, margin=dict(l=10, r=10, t=10, b=10),
         yaxis_title="MW", xaxis_title="Time (CT)",
@@ -299,22 +325,26 @@ def panel_duck_curve(an: Analytics) -> None:
 # --------------------------------------------------------------------------- #
 def panel_alerts(an: Analytics, market: str) -> None:
     st.subheader("Alerts  ·  current heat-rate dislocations")
+    st.caption(
+        "Normalized vs. the same hour-of-day over a trailing window, on "
+        "log heat rate (HR has a fat right tail from scarcity). Simultaneous "
+        "cross-hub breaches are collapsed into one system-level event."
+    )
     alerts = _safe(lambda: an.active_alerts(market=market), pd.DataFrame())
     if alerts is None or alerts.empty:
         st.success(f"No dislocations in the last 24h beyond "
-                   f"±{SETTINGS.sigma_threshold}σ.")
+                   f"±{SETTINGS.sigma_threshold}σ (hour-conditioned, log HR).")
         return
     disp = alerts.copy()
     disp["interval_start"] = (disp["interval_start"]
                               .dt.tz_convert("US/Central")
                               .dt.strftime("%Y-%m-%d %H:%M"))
+    disp["max_abs_z"] = disp["max_abs_z"].round(2)
     disp = disp.rename(columns={
-        "interval_start": "Interval (CT)", "hub": "Hub",
-        "implied_hr": "Implied HR", "hr_mean": "30d Mean",
-        "hr_std": "30d Std", "hr_z": "z-score", "direction": "Direction",
+        "interval_start": "Interval (CT)", "direction": "Direction",
+        "hubs": "Affected hubs", "n_hubs": "# hubs",
+        "max_abs_z": "Peak |z|", "detail": "Detail",
     })
-    for c in ["Implied HR", "30d Mean", "30d Std", "z-score"]:
-        disp[c] = disp[c].round(2)
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 

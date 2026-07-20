@@ -116,25 +116,65 @@ class Analytics:
         return out[cols]
 
     def _add_rolling_stats(self, df: pd.DataFrame) -> pd.DataFrame:
-        window = f"{self.settings.rolling_window_days}D"
+        """Attach a normalized dislocation signal to each interval.
+
+        Two corrections over a naive pooled mean +/- 2 sigma band:
+
+        1. **Log heat rate.** Implied HR is bounded near zero and has a fat
+           right tail from scarcity pricing, so it is far from normal. We take
+           z-scores of ln(HR); a symmetric band on the log scale is much closer
+           to a true ~5% tail and stops firing constantly on the high side
+           while never firing on the low side.
+        2. **Hour-of-day conditioning.** HR has a strong diurnal shape (low
+           overnight, high on the evening ramp). Pooling all hours means the
+           ramp trips the alert every single day -- that is the diurnal
+           pattern, not a dislocation. We compute mu/sigma from the trailing
+           window of the *same hour of day* so a breach means "rich/cheap
+           relative to how this hour normally behaves."
+
+        Bands (hr_mean/upper/lower) are reported back on the natural HR scale
+        (via exp) so the chart still reads in heat-rate units.
+        """
+        window_days = self.settings.rolling_window_days
         sigma = self.settings.sigma_threshold
+        # hour-conditioned stats need more history than a pooled window, since
+        # each hour only sees ~1 obs/day. Widen to >=60d (or configured window).
+        cond_days = max(window_days, 60)
+        min_periods = max(5, int(cond_days * self.settings.min_periods_frac))
+
         pieces = []
         for hub_label, sub in df.groupby("hub"):
-            sub = sub.sort_values("interval_start").copy()
-            s = sub.set_index("interval_start")["implied_hr"]
-            min_periods = max(
-                2,
-                int(self.settings.rolling_window_days
-                    * self.settings.min_periods_frac),
-            )
-            roll = s.rolling(window, min_periods=min_periods)
-            sub["hr_mean"] = roll.mean().values
-            sub["hr_std"] = roll.std().values
+            sub = sub.sort_values("interval_start").reset_index(drop=True).copy()
+            local = sub["interval_start"].dt.tz_convert("US/Central")
+            sub["_hod"] = local.dt.hour
             with np.errstate(invalid="ignore", divide="ignore"):
-                sub["hr_z"] = (sub["implied_hr"] - sub["hr_mean"]) / sub["hr_std"]
-            sub["upper"] = sub["hr_mean"] + sigma * sub["hr_std"]
-            sub["lower"] = sub["hr_mean"] - sigma * sub["hr_std"]
+                sub["_log_hr"] = np.log(sub["implied_hr"].where(sub["implied_hr"] > 0))
+
+            hod_mean = np.full(len(sub), np.nan)
+            hod_std = np.full(len(sub), np.nan)
+            # rolling stats within each hour-of-day bucket, over a trailing
+            # calendar window, computed on log(HR).
+            for _hod, g in sub.groupby("_hod"):
+                g = g.sort_values("interval_start")
+                s = g.set_index("interval_start")["_log_hr"]
+                roll = s.rolling(f"{cond_days}D", min_periods=min_periods)
+                m = roll.mean()
+                sd = roll.std()
+                hod_mean[g.index] = m.values
+                hod_std[g.index] = sd.values
+
+            sub["_logmean"] = hod_mean
+            sub["_logstd"] = hod_std
+            with np.errstate(invalid="ignore", divide="ignore"):
+                sub["hr_z"] = (sub["_log_hr"] - sub["_logmean"]) / sub["_logstd"]
+            # report bands back on the natural HR scale for the chart
+            sub["hr_mean"] = np.exp(sub["_logmean"])
+            sub["upper"] = np.exp(sub["_logmean"] + sigma * sub["_logstd"])
+            sub["lower"] = np.exp(sub["_logmean"] - sigma * sub["_logstd"])
+            # keep an hr_std column for display continuity (natural-scale approx)
+            sub["hr_std"] = (sub["upper"] - sub["lower"]) / (2 * sigma)
             sub["dislocation"] = sub["hr_z"].abs() > sigma
+            sub = sub.drop(columns=["_hod", "_log_hr", "_logmean", "_logstd"])
             pieces.append(sub)
         return pd.concat(pieces, ignore_index=True)
 
@@ -209,24 +249,45 @@ class Analytics:
             result_rows.append(row)
         return pd.DataFrame(result_rows)
 
+    _ALERT_COLS = [
+        "interval_start", "direction", "hubs", "n_hubs",
+        "max_abs_z", "detail",
+    ]
+
     def active_alerts(self, market: str = "DAY_AHEAD_HOURLY", lookback_hours: int = 24) -> pd.DataFrame:
-        """Recent intervals whose implied HR is a >sigma dislocation."""
+        """Recent >sigma HR dislocations, **deduped to system-level events**.
+
+        Multiple hubs breaching the same direction in the same interval is ONE
+        event (usually a shared marginal-unit / scarcity condition), not N
+        separate alerts. We collapse by (interval, direction) and list the
+        affected hubs, ranked by the strongest |z| in the group.
+        """
         hr = self.heat_rate_series(market=market)
         if hr.empty:
-            return pd.DataFrame(columns=[
-                "interval_start", "hub", "implied_hr", "hr_mean",
-                "hr_std", "hr_z", "direction",
-            ])
+            return pd.DataFrame(columns=self._ALERT_COLS)
         cutoff = hr["interval_start"].max() - pd.Timedelta(hours=lookback_hours)
         recent = hr[(hr["interval_start"] >= cutoff) & (hr["dislocation"] == True)].copy()  # noqa: E712
         if recent.empty:
-            return pd.DataFrame(columns=[
-                "interval_start", "hub", "implied_hr", "hr_mean",
-                "hr_std", "hr_z", "direction",
-            ])
+            return pd.DataFrame(columns=self._ALERT_COLS)
         recent["direction"] = np.where(recent["hr_z"] > 0, "HIGH (rich)", "LOW (cheap)")
-        return (recent[["interval_start", "hub", "implied_hr", "hr_mean",
-                        "hr_std", "hr_z", "direction"]]
+
+        events = []
+        for (ts, direction), g in recent.groupby(["interval_start", "direction"]):
+            g = g.reindex(g["hr_z"].abs().sort_values(ascending=False).index)
+            hubs = list(g["hub"])
+            detail = ", ".join(
+                f"{h} HR {ihr:.1f} (z {z:+.1f})"
+                for h, ihr, z in zip(g["hub"], g["implied_hr"], g["hr_z"])
+            )
+            events.append({
+                "interval_start": ts,
+                "direction": direction,
+                "hubs": ", ".join(hubs),
+                "n_hubs": len(hubs),
+                "max_abs_z": float(g["hr_z"].abs().max()),
+                "detail": detail,
+            })
+        return (pd.DataFrame(events, columns=self._ALERT_COLS)
                 .sort_values("interval_start", ascending=False)
                 .reset_index(drop=True))
 
@@ -261,9 +322,24 @@ class Analytics:
             df = load.copy()
             df["renewables"] = np.nan
 
-        df["renewables"] = df["renewables"].fillna(0)
+        df = df.sort_values("interval_start").reset_index(drop=True)
+        # Do NOT blanket-fill missing renewables with 0: the two feeds can be
+        # published one interval out of sync, so the newest load interval often
+        # has no fuel-mix match yet. Filling 0 there makes net_load jump up to
+        # equal load for that single point (the spurious vertical drop the
+        # review flagged). Instead:
+        #   * interior gaps -> interpolate (renewables move smoothly),
+        #   * unmatched leading/trailing edge intervals -> drop, so load and
+        #     net_load always start and end on the same interval.
+        if df["renewables"].notna().any():
+            first = df["renewables"].first_valid_index()
+            last = df["renewables"].last_valid_index()
+            df = df.loc[first:last].copy()
+            df["renewables"] = df["renewables"].interpolate(limit_direction="both")
+        else:
+            df["renewables"] = 0.0
         df["net_load"] = df["load"] - df["renewables"]
-        return df.sort_values("interval_start").reset_index(drop=True)
+        return df.reset_index(drop=True)
 
     @staticmethod
     def evening_ramp(net_load: pd.DataFrame) -> dict:
