@@ -27,7 +27,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from .config import HUBS_BY_LABEL, SETTINGS, UNIT_CLASSES, Settings
+from .config import HUBS_BY_LABEL, SETTINGS, UNIT_CLASSES, Hub, Settings
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -41,25 +41,112 @@ class Analytics:
     # ------------------------------------------------------------------ #
     # gas price series -- one representative $/MMBtu series per hub
     # ------------------------------------------------------------------ #
-    def _gas_for_hub(self, hub_label: str, start=None) -> pd.DataFrame:
-        """Return a daily gas price series (columns: date, gas_price) for a hub.
-
-        ERCOT has no per-hub gas feed, so every hub uses the same reference gas:
-        the EIA Henry Hub daily spot price. If no EIA gas is cached (e.g. no
-        EIA_API_KEY was set), this returns an empty frame and implied heat rates
-        degrade to n/a rather than crashing.
+    def _gas_series(self, source: str, region: str, start=None) -> pd.DataFrame:
+        """Read a daily gas price series (columns: date, gas_price) from the
+        cache for a given (source, region), collapsing any duplicate-day rows
+        with a mean. Returns an empty typed frame if nothing is cached.
         """
-        hub = HUBS_BY_LABEL.get(hub_label)
-        if hub is None:
-            return pd.DataFrame(columns=["date", "gas_price"])
-
-        g = self.storage.read_gas(source="eia", region="HENRY_HUB", start=start)
+        g = self.storage.read_gas(source=source, region=region, start=start)
         if g.empty:
             return pd.DataFrame(columns=["date", "gas_price"])
         g = g.dropna(subset=["price"]).copy()
+        if g.empty:
+            return pd.DataFrame(columns=["date", "gas_price"])
         g["date"] = g["interval_start"].dt.tz_convert("US/Central").dt.normalize()
         return (g.groupby("date", as_index=False)["price"]
                  .mean().rename(columns={"price": "gas_price"}))
+
+    def _gas_for_hub(self, hub_label: str, start=None) -> pd.DataFrame:
+        """Return a daily gas price series for a hub.
+
+        Columns: date, gas_price, gas_estimated (bool).
+
+        Most ERCOT hubs have no native gas feed, so they use the EIA Henry Hub
+        daily spot price as a reference gas (``gas_estimated`` is always False
+        for these -- it is a deliberate proxy choice, not a data gap).
+
+        HB_WEST is different: it is wired to real Waha (Permian) gas via
+        OilPriceAPI (see config.HUBS / data.fetch_gas_waha). OilPriceAPI's free
+        tier reliably gives only the *latest* daily quote, so Waha history can
+        be sparse or missing entirely. To keep West's rolling heat-rate window
+        populated we apply a graceful fallback:
+
+          1. Read whatever real Waha rows are cached.
+          2. Read Henry Hub daily rows (deep history, always available once an
+             EIA key is set).
+          3. Compute the observed Waha-minus-HenryHub basis on the dates where
+             both series overlap (median basis over the overlap).
+          4. For West dates with a real Waha price, use it as-is
+             (gas_estimated=False). For older West dates with no Waha price,
+             estimate gas = HenryHub_that_day + observed_basis
+             (gas_estimated=True) so the basis, which is typically negative,
+             discounts Henry Hub the way Waha actually trades.
+
+        If there is no Waha data at all (e.g. no OILPRICEAPI_KEY), West falls
+        back entirely to Henry Hub, all rows flagged gas_estimated=True, so the
+        hub still shows *something* rather than going blank -- callers/UI
+        should label this clearly as an HH proxy.
+        """
+        hub = HUBS_BY_LABEL.get(hub_label)
+        empty = pd.DataFrame(columns=["date", "gas_price", "gas_estimated"])
+        if hub is None:
+            return empty
+
+        henry = self._gas_series("eia", "HENRY_HUB", start=start)
+
+        if hub.gas_source != "oilpriceapi":
+            # Standard proxy hubs: Henry Hub as-is, not an estimate.
+            if henry.empty:
+                return empty
+            out = henry.copy()
+            out["gas_estimated"] = False
+            return out
+
+        # --- HB_WEST: real Waha with graceful basis-fallback to Henry Hub ---
+        waha = self._gas_series("oilpriceapi", hub.gas_region, start=start)
+
+        if waha.empty:
+            # No Waha data at all -- fall back entirely to Henry Hub, flagged.
+            if henry.empty:
+                return empty
+            out = henry.copy()
+            out["gas_estimated"] = True
+            return out
+
+        if henry.empty:
+            # Have Waha but no Henry Hub to backfill older dates with -- just
+            # use the real Waha rows we have.
+            out = waha.copy()
+            out["gas_estimated"] = False
+            return out
+
+        merged = pd.merge(
+            waha, henry, on="date", how="inner", suffixes=("_waha", "_hh"),
+        )
+        if not merged.empty:
+            basis = float((merged["gas_price_waha"] - merged["gas_price_hh"]).median())
+        else:
+            basis = float("nan")
+
+        waha_dates = set(waha["date"])
+        hh_only = henry[~henry["date"].isin(waha_dates)].copy()
+        if not hh_only.empty and pd.notna(basis):
+            hh_only["gas_price"] = hh_only["gas_price"] + basis
+            hh_only["gas_estimated"] = True
+        elif not hh_only.empty:
+            # No overlap to compute a basis from yet (e.g. Waha history is
+            # only 1 day old) -- still surface Henry Hub as an estimate rather
+            # than leaving a hole in the window.
+            hh_only["gas_estimated"] = True
+        else:
+            hh_only["gas_estimated"] = pd.Series(dtype=bool)
+
+        waha_out = waha.copy()
+        waha_out["gas_estimated"] = False
+
+        out = pd.concat([waha_out, hh_only[["date", "gas_price", "gas_estimated"]]],
+                         ignore_index=True)
+        return out.sort_values("date").reset_index(drop=True)
 
     # ------------------------------------------------------------------ #
     # implied heat rate time series per hub
@@ -77,6 +164,7 @@ class Analytics:
             return pd.DataFrame(columns=[
                 "interval_start", "hub", "lmp", "gas_price", "implied_hr",
                 "hr_mean", "hr_std", "hr_z", "dislocation", "upper", "lower",
+                "gas_estimated",
             ])
 
         frames = []
@@ -88,12 +176,13 @@ class Analytics:
             sub["date"] = sub["interval_start"].dt.tz_convert("US/Central").dt.normalize()
             if gas.empty:
                 sub["gas_price"] = np.nan
+                sub["gas_estimated"] = False
             else:
-                # EIA Henry Hub daily spot prices lag a few business days, so an
-                # exact same-day join leaves today's LMPs without gas. Use an
-                # as-of (backward) join so each interval picks up the most recent
-                # available gas price on or before its date, then forward-fill
-                # any remaining leading gaps.
+                # EIA Henry Hub / Waha daily spot prices lag a few business
+                # days, so an exact same-day join leaves today's LMPs without
+                # gas. Use an as-of (backward) join so each interval picks up
+                # the most recent available gas price on or before its date,
+                # then forward-fill any remaining leading gaps.
                 gas = gas.sort_values("date").reset_index(drop=True)
                 sub = sub.sort_values("date").reset_index(drop=True)
                 sub = pd.merge_asof(
@@ -102,7 +191,14 @@ class Analytics:
                 # if the very first days precede all gas history, backfill from
                 # the earliest known gas price so heat rates still compute.
                 sub["gas_price"] = sub["gas_price"].ffill().bfill()
-            sub["implied_hr"] = sub["lmp"] / sub["gas_price"].replace(0, np.nan)
+                sub["gas_estimated"] = sub["gas_estimated"].ffill().bfill()
+                sub["gas_estimated"] = sub["gas_estimated"].fillna(False).astype(bool)
+            # Guard the divide: a near-zero (or negative-near-zero, which Waha
+            # can genuinely be) gas price makes lmp/gas explode toward +-inf
+            # rather than a meaningful heat rate, so treat |gas| < 0.10 as
+            # undefined instead of computing a spurious huge/inf number.
+            safe_gas = sub["gas_price"].where(sub["gas_price"].abs() >= 0.10)
+            sub["implied_hr"] = sub["lmp"] / safe_gas
             frames.append(sub)
 
         if not frames:
@@ -112,7 +208,8 @@ class Analytics:
         out = out.sort_values(["hub", "interval_start"]).reset_index(drop=True)
         out = self._add_rolling_stats(out)
         cols = ["interval_start", "hub", "lmp", "gas_price", "implied_hr",
-                "hr_mean", "hr_std", "hr_z", "dislocation", "upper", "lower"]
+                "hr_mean", "hr_std", "hr_z", "dislocation", "upper", "lower",
+                "gas_estimated"]
         return out[cols]
 
     def _add_rolling_stats(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -137,10 +234,18 @@ class Analytics:
         """
         window_days = self.settings.rolling_window_days
         sigma = self.settings.sigma_threshold
-        # hour-conditioned stats need more history than a pooled window, since
-        # each hour only sees ~1 obs/day. Widen to >=60d (or configured window).
+        # hour-conditioned stats need more calendar history than a pooled
+        # window, since each hour-of-day bucket only sees ~1 obs/day. Widen the
+        # lookback to >=60d (or the configured window).
         cond_days = max(window_days, 60)
-        min_periods = max(5, int(cond_days * self.settings.min_periods_frac))
+        # IMPORTANT: min_periods here is a count of *same-hour* observations,
+        # NOT a fraction of the calendar window. Reusing min_periods_frac * days
+        # (=30) demanded ~30 days of history at each specific hour before ANY
+        # band/z-score appeared -- with a 45d backfill that left the ±2σ band
+        # blank and, worse, hr_z NaN everywhere so the alert could never fire
+        # ("no dislocations" was a dead detector, not a calm market). A stable
+        # per-hour mean/std needs only ~10 samples, so floor at that.
+        min_periods = self.settings.hod_min_samples
 
         pieces = []
         for hub_label, sub in df.groupby("hub"):
@@ -227,11 +332,15 @@ class Analytics:
         sparks = self.spark_spreads(market=market)
         result_rows = []
         for _, r in latest.iterrows():
+            hub_cfg = HUBS_BY_LABEL.get(r["hub"])
+            gas_estimated = bool(r.get("gas_estimated")) if pd.notna(r.get("gas_estimated")) else False
             row = {
                 "hub": r["hub"],
                 "interval_start": r["interval_start"],
                 "lmp": r["lmp"],
                 "gas_price": r["gas_price"],
+                "gas_label": hub_cfg.gas_label if hub_cfg is not None else "",
+                "gas_estimated": gas_estimated,
                 "implied_hr": r["implied_hr"],
                 "hr_mean": r["hr_mean"],
                 "hr_std": r["hr_std"],

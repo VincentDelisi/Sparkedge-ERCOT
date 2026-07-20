@@ -22,14 +22,22 @@ from pathlib import Path
 # ERCOT exposes its trading hubs as settlement-point aggregates. ``node`` is the
 # exact identifier gridstatus returns in the "Location" column of get_spp when
 # ``location_type="Trading Hub"``; ``label`` is the friendly name used in the UI.
-# ERCOT has no per-hub gas feed, so every hub maps to the same reference gas
-# (EIA Henry Hub); ``gas_region`` is retained only as a bookkeeping label.
+# ERCOT has no native per-hub gas feed, so each hub is wired to a *reference*
+# gas price: ``gas_source`` selects the fetcher/provider ("eia" for Henry Hub,
+# "oilpriceapi" for Waha), ``gas_region`` is the storage-key region label used
+# in the gas_price table, and ``gas_label`` is the human-readable string shown
+# in the UI so users know exactly which gas point a hub's implied heat rate is
+# dividing by. HB_WEST sits in the Permian and trades on a deep, volatile
+# discount to Henry Hub, so it uses real Waha gas; the other three hubs keep
+# Henry Hub as a defensible proxy (EIA itself pairs ERCOT North with Henry Hub).
 @dataclass(frozen=True)
 class Hub:
     label: str          # e.g. "Houston"
     node: str           # e.g. "HB_HOUSTON"
-    gas_region: str     # gas proxy label (ERCOT: always Henry Hub)
+    gas_region: str     # gas storage-region label, e.g. "HENRY_HUB" or "WAHA"
     description: str = ""
+    gas_source: str = "eia"          # "eia" | "oilpriceapi"
+    gas_label: str = "Henry Hub (EIA) — proxy"  # human string for the UI
 
 
 HUBS: list[Hub] = [
@@ -38,24 +46,32 @@ HUBS: list[Hub] = [
         node="HB_HOUSTON",
         gas_region="HENRY_HUB",
         description="ERCOT Houston trading hub (HB_HOUSTON)",
+        gas_source="eia",
+        gas_label="Henry Hub (EIA) — proxy",
     ),
     Hub(
         label="North",
         node="HB_NORTH",
         gas_region="HENRY_HUB",
         description="ERCOT North trading hub (HB_NORTH)",
+        gas_source="eia",
+        gas_label="Henry Hub (EIA) — proxy",
     ),
     Hub(
         label="West",
         node="HB_WEST",
-        gas_region="HENRY_HUB",
+        gas_region="WAHA",
         description="ERCOT West trading hub (HB_WEST)",
+        gas_source="oilpriceapi",
+        gas_label="Waha (OilPriceAPI)",
     ),
     Hub(
         label="South",
         node="HB_SOUTH",
         gas_region="HENRY_HUB",
         description="ERCOT South trading hub (HB_SOUTH)",
+        gas_source="eia",
+        gas_label="Henry Hub (EIA) — proxy",
     ),
 ]
 
@@ -124,6 +140,8 @@ class Settings:
     rolling_window_days: int = 30      # window for HR mean / std
     sigma_threshold: float = 2.0       # dislocation flag threshold (in std devs)
     min_periods_frac: float = 0.5      # min fraction of window needed for a stat
+    hod_min_samples: int = 10          # min *same-hour* obs before a band/z-score
+                                       # is emitted (hour-of-day conditioned)
 
     # --- API rate limiting ---
     # gridstatus already sleeps between paginated calls; we add our own inter-call
@@ -157,8 +175,17 @@ class Settings:
 
     # --- gas price source preference ---
     # ERCOT has no per-hub gas feed, so Henry Hub (EIA) is the reference gas for
-    # every hub. "eia" -> use Henry Hub as the primary reference gas.
+    # most hubs. "eia" -> use Henry Hub as the primary reference gas.
     gas_source_primary: str = "eia"
+
+    # --- OilPriceAPI (Waha / Permian gas, used for HB_WEST) ---
+    # Free tier: 200 req/month, 10/min after the 7-day trial. We only pull the
+    # daily "latest" quote (fits comfortably in the free quota), and treat any
+    # historical backfill as optional/best-effort -- see data.fetch_gas_waha.
+    oilpriceapi_key: str = field(
+        default_factory=lambda: os.environ.get("OILPRICEAPI_KEY", "")
+    )
+    oilpriceapi_waha_code: str = "NATURAL_GAS_WAHA"
 
     # --- backfill defaults ---
     backfill_days: int = 45            # enough to seed a 30d rolling window
@@ -171,10 +198,14 @@ class Settings:
             self.rolling_window_days = int(env["SPARKEDGE_ROLLING_DAYS"])
         if "SPARKEDGE_SIGMA" in env:
             self.sigma_threshold = float(env["SPARKEDGE_SIGMA"])
+        if "SPARKEDGE_HOD_MIN_SAMPLES" in env:
+            self.hod_min_samples = int(env["SPARKEDGE_HOD_MIN_SAMPLES"])
         if "SPARKEDGE_GAS_SOURCE" in env:
             self.gas_source_primary = env["SPARKEDGE_GAS_SOURCE"].lower()
         if "SPARKEDGE_OASIS_SLEEP" in env:
             self.oasis_sleep_seconds = int(env["SPARKEDGE_OASIS_SLEEP"])
+        if "OILPRICEAPI_KEY" in env:
+            self.oilpriceapi_key = env["OILPRICEAPI_KEY"]
 
 
 # A module-level singleton is convenient for the app; callers may also build

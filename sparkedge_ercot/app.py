@@ -208,6 +208,10 @@ def panel_money_strip(an: Analytics, market: str) -> None:
     ts = snap["interval_start"].max()
     st.caption(f"As of interval starting {pd.Timestamp(ts).tz_convert('US/Central'):%Y-%m-%d %H:%M} CT "
                f"· {market.replace('_', ' ').title()}")
+    st.caption(
+        "Implied HR = hub LMP ÷ the hub's reference gas. West uses Waha (Permian); "
+        "others use Henry Hub as a proxy (HSC/Agua Dulce basis not yet sourced)."
+    )
 
     # --- Legend: how to read the lights ---
     st.markdown(
@@ -228,6 +232,13 @@ def panel_money_strip(an: Analytics, market: str) -> None:
             ihr_txt = f"{ihr:.2f}" if pd.notna(ihr) else "—"
             gas = row.get("gas_price")
             gas_txt = f"${gas:.2f}" if pd.notna(gas) else "n/a"
+            gas_label = row.get("gas_label") or ""
+            gas_estimated = bool(row.get("gas_estimated"))
+            gas_line = f"LMP ${row.get('lmp', float('nan')):.2f} · Gas {gas_txt}/MMBtu"
+            if gas_label:
+                gas_line += f" · {gas_label}"
+            if gas_estimated and pd.notna(gas):
+                gas_line += " · est. (HH−basis)"
             st.markdown(f"### {hub}")
             st.metric("Implied HR", ihr_txt,
                       help=("Implied Heat Rate = power price (LMP) ÷ gas price, in MMBtu/MWh. "
@@ -235,7 +246,7 @@ def panel_money_strip(an: Analytics, market: str) -> None:
                             "A generating unit is profitable (\U0001F7E2) when its own heat rate is "
                             "BELOW this number, and unprofitable (\U0001F534) when it's above. "
                             "Lower Implied HR = tougher conditions for gas plants."))
-            st.caption(f"LMP ${row.get('lmp', float('nan')):.2f} · Gas {gas_txt}/MMBtu")
+            st.caption(gas_line)
             for u in UNIT_CLASSES:
                 itm = row.get(f"itm_{u.key}")
                 spark = row.get(f"spark_{u.key}")

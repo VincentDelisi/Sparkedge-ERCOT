@@ -5,14 +5,17 @@ Pulls everything Sparkedge ERCOT needs and writes it into the SQLite cache:
 * ERCOT day-ahead hourly + real-time 15-min SPP for the trading hubs (gridstatus)
 * ERCOT load, load forecast, fuel mix                               (gridstatus)
 * EIA Henry Hub daily spot natural-gas price                        (EIA v2 API)
+* Waha (Permian) daily natural-gas price, for HB_WEST only          (OilPriceAPI)
 
 Every network call is wrapped so that a failure is *logged and swallowed*: the
 fetchers return the number of rows written (0 on failure) and never raise into
 the caller. This is what lets the Streamlit app "degrade, not crash" -- if a
 source is down the app simply serves whatever is already cached.
 
-ERCOT has no per-hub gas feed, so gas comes exclusively from EIA Henry Hub. We
-keep modest inter-call sleeps and retries so a flaky pull doesn't abort a run.
+ERCOT has no per-hub gas feed. Most hubs use EIA Henry Hub as their reference
+gas; HB_WEST instead uses real Waha (Permian) gas from OilPriceAPI, since Waha
+trades on a deep, volatile discount to Henry Hub. We keep modest inter-call
+sleeps and retries so a flaky pull doesn't abort a run.
 """
 
 from __future__ import annotations
@@ -242,6 +245,113 @@ class DataService:
         return self.storage.upsert_gas(rows)
 
     # ------------------------------------------------------------------ #
+    # Gas -- OilPriceAPI Waha (Permian gas, reference for HB_WEST only)
+    # ------------------------------------------------------------------ #
+    def fetch_gas_waha(self) -> int:
+        """Pull the latest Waha (Permian) gas price from OilPriceAPI.
+
+        OilPriceAPI's free tier is a daily-latest quota (200 req/month, 10/min
+        after the 7-day trial), so this stores exactly ONE row per call: the
+        latest Waha quote, keyed at today's UTC midnight. Historical backfill
+        via the /v1/prices/historical endpoint is attempted best-effort -- it
+        is NOT guaranteed on the free tier, so any failure there is caught and
+        swallowed; the graceful Waha-history fallback in
+        ``compute.Analytics._gas_for_hub`` covers the resulting gaps.
+
+        Returns the number of rows written (0 if no key or the pull failed).
+        """
+        key = self.settings.oilpriceapi_key
+        if not key:
+            log.info("OILPRICEAPI_KEY not set -- skipping Waha pull "
+                      "(HB_WEST implied heat rate will fall back to Henry Hub "
+                      "until a key is provided).")
+            return 0
+
+        import requests  # local import keeps module import cheap
+
+        headers = {"Authorization": f"Token {key}"}
+        latest_url = "https://api.oilpriceapi.com/v1/prices/latest"
+        params = {"by_code": self.settings.oilpriceapi_waha_code}
+
+        def _do_latest():
+            resp = requests.get(latest_url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+
+        payload = _with_retries(_do_latest, label="gas:waha_latest", settings=self.settings)
+        rows_written = 0
+        if payload:
+            data = payload.get("data") or payload.get("result") or payload
+            price = None
+            if isinstance(data, dict):
+                price = data.get("price") or data.get("value")
+            if price is not None:
+                today = pd.Timestamp.now(tz="UTC").normalize()
+                rows = [{
+                    "interval_start": today.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "source": "oilpriceapi",
+                    "region": "WAHA",
+                    "price": _f(price),
+                }]
+                rows_written += self.storage.upsert_gas(rows)
+            else:
+                log.warning("[gas:waha_latest] response had no parsable price: %s", payload)
+        else:
+            log.warning("[gas:waha_latest] no data returned -- HB_WEST gas will rely on "
+                        "cached history / Henry Hub fallback.")
+
+        # Optional history: free-tier availability is not guaranteed, so this is
+        # strictly best-effort -- any failure here must not fail the refresh.
+        try:
+            hist_url = "https://api.oilpriceapi.com/v1/prices/historical"
+            end = date.today()
+            start = end - timedelta(days=self.settings.backfill_days)
+            hist_params = {
+                "by_code": self.settings.oilpriceapi_waha_code,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "interval": "day",
+            }
+
+            def _do_hist():
+                resp = requests.get(hist_url, params=hist_params, headers=headers, timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+
+            hist_payload = _with_retries(_do_hist, label="gas:waha_history", settings=self.settings)
+            if hist_payload:
+                records = (
+                    hist_payload.get("data")
+                    or hist_payload.get("prices")
+                    or hist_payload.get("result")
+                    or []
+                )
+                if isinstance(records, list) and records:
+                    hist_rows = []
+                    for rec in records:
+                        if not isinstance(rec, dict):
+                            continue
+                        period = rec.get("date") or rec.get("period") or rec.get("created_at")
+                        val = rec.get("price") or rec.get("value")
+                        if period is None or val is None:
+                            continue
+                        ts = pd.Timestamp(period, tz="UTC").normalize()
+                        hist_rows.append({
+                            "interval_start": ts.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "source": "oilpriceapi",
+                            "region": "WAHA",
+                            "price": _f(val),
+                        })
+                    if hist_rows:
+                        rows_written += self.storage.upsert_gas(hist_rows)
+                        log.info("[gas:waha_history] upserted %d historical rows", len(hist_rows))
+        except Exception as exc:  # noqa: BLE001 - optional path, never fail the refresh
+            log.info("[gas:waha_history] unavailable on this plan/endpoint (%s) -- "
+                     "relying on latest-only + basis fallback in compute.py.", exc)
+
+        return rows_written
+
+    # ------------------------------------------------------------------ #
     # Orchestration
     # ------------------------------------------------------------------ #
     def refresh_today(self) -> dict[str, int]:
@@ -254,6 +364,7 @@ class DataService:
         results["load_forecast"] = self.fetch_load_forecast(today)
         results["fuel_mix"] = self.fetch_fuel_mix(today)
         results["gas_eia"] = self.fetch_gas_eia(date.today() - timedelta(days=7))
+        results["gas_waha"] = self.fetch_gas_waha()
         self.storage.set_meta("last_refresh", pd.Timestamp.utcnow().isoformat())
         log.info("refresh_today complete: %s", results)
         return results
@@ -269,11 +380,15 @@ class DataService:
         start = end - pd.Timedelta(days=days)
         totals: dict[str, int] = {
             "lmp_dam": 0, "lmp_rt": 0, "load": 0,
-            "load_forecast": 0, "fuel_mix": 0, "gas_eia": 0,
+            "load_forecast": 0, "fuel_mix": 0, "gas_eia": 0, "gas_waha": 0,
         }
 
         # Gas via EIA can be pulled as a range (cheap, daily grain).
         totals["gas_eia"] += self.fetch_gas_eia(start.date(), end.date())
+        # Waha (OilPriceAPI) is a single daily-latest pull on the free tier;
+        # fetch_gas_waha() also makes a best-effort attempt at history so a
+        # backfill gets as much real Waha coverage as the plan allows.
+        totals["gas_waha"] += self.fetch_gas_waha()
 
         # Day-ahead LMP + load + fuel mix: iterate day by day.
         cur = start
