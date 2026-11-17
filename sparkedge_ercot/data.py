@@ -364,7 +364,16 @@ class DataService:
         results["load_forecast"] = self.fetch_load_forecast(today)
         results["fuel_mix"] = self.fetch_fuel_mix(today)
         results["gas_eia"] = self.fetch_gas_eia(date.today() - timedelta(days=7))
-        results["gas_waha"] = self.fetch_gas_waha()
+        # Waha comes from OilPriceAPI, whose free tier allows about 200 requests
+        # a month, and the price is a daily quote. Pull it once per UTC day, and
+        # mark the day before calling so a failing pull is not retried every
+        # refresh.
+        utc_day = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+        if self.storage.get_meta("waha_pull_date") != utc_day:
+            self.storage.set_meta("waha_pull_date", utc_day)
+            results["gas_waha"] = self.fetch_gas_waha()
+        else:
+            results["gas_waha"] = 0
         self.storage.set_meta("last_refresh", pd.Timestamp.utcnow().isoformat())
         log.info("refresh_today complete: %s", results)
         return results

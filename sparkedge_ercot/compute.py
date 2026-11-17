@@ -319,13 +319,20 @@ class Analytics:
     # live snapshots for the UI strip / alerts
     # ------------------------------------------------------------------ #
     def latest_snapshot(self, market: str = "DAY_AHEAD_HOURLY") -> pd.DataFrame:
-        """One row per hub at the most recent available interval, with the
+        """One row per hub at the current interval (the latest one that has
+        already started), with the
         implied HR, its rolling band, dislocation flag, and per-unit in/out of
         money booleans.
         """
         hr = self.heat_rate_series(market=market)
         if hr.empty:
             return pd.DataFrame()
+        # Day-ahead prices are posted for the whole day, so "most recent row" is
+        # tonight's last hour, not now. Use the latest interval that has started.
+        now = pd.Timestamp.now(tz="UTC")
+        started = hr[pd.to_datetime(hr["interval_start"], utc=True) <= now]
+        if not started.empty:
+            hr = started
         latest = (hr.sort_values("interval_start")
                     .groupby("hub", as_index=False).tail(1))
 
