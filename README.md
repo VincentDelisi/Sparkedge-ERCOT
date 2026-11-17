@@ -79,7 +79,7 @@ python -m sparkedge_ercot --serve
 python -m sparkedge_ercot --status
 ```
 
-The dashboard also has a **"Refresh today's data"** button in the sidebar.
+The dashboard also has a **"Refresh now"** button in the sidebar.
 
 ---
 
